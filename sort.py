@@ -2,9 +2,9 @@
 """
 Sort exported CloudWatch JSONL files after collection.
 
-This is intended for large files produced by extract_aws_web_traffic_evidence.py.
+This is intended for large files produced by extract.py
 It sorts records by their CloudWatch event timestamp without loading the whole
-file into memory. It can optionally remove duplicate CloudWatch event IDs.
+file into memory. It will remove duplicate CloudWatch event IDs.
 """
 
 from __future__ import annotations
@@ -12,9 +12,9 @@ from __future__ import annotations
 import argparse
 import hashlib
 import heapq
-import json
 import multiprocessing as mp
 import os
+import sys
 import tempfile
 from concurrent.futures import ALL_COMPLETED, FIRST_COMPLETED, ProcessPoolExecutor, wait
 from dataclasses import dataclass
@@ -24,7 +24,8 @@ from pathlib import Path
 try:
     import orjson
 except ImportError:
-    orjson = None
+    print("[!] Missing required dependency: orjson. Install it with: .venv/bin/pip install orjson", file=sys.stderr)
+    raise SystemExit(1)
 
 
 DEFAULT_EXPORT_PREFIX = "aws_web_traffic_export_"
@@ -66,8 +67,8 @@ def default_input_path(export_dir: Path) -> Path:
 
 def event_key(line: str, sequence: int) -> tuple[int, str, int]:
     try:
-        event = orjson.loads(line) if orjson else json.loads(line)
-    except Exception:
+        event = orjson.loads(line)
+    except orjson.JSONDecodeError:
         return (10**30, f"parse-error-{sequence}", sequence)
 
     timestamp = event.get("timestamp")
@@ -272,12 +273,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--dedupe",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help="Drop duplicate CloudWatch event IDs while merging.",
     )
     parser.add_argument(
         "--chunk-size",
-        default="512mb",
+        default="2048mb",
         help="Approximate in-memory chunk size before writing a sorted temp chunk.",
     )
     parser.add_argument(

@@ -4,6 +4,8 @@ import gzip
 import json
 import os
 import re
+import subprocess
+import sys
 from collections import deque
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -305,6 +307,93 @@ def download_s3_prefix(out, region, bucket, prefix, label):
         f"skipped_existing={skipped:,}, bytes={total_bytes:,}"
     )
     return {"downloaded": count, "skipped_existing": skipped, "bytes": total_bytes}
+
+
+def sort_marker_path(path: Path) -> Path:
+    return path.with_name(f"{path.stem}_sort.json")
+
+
+def sort_marker_matches(path: Path) -> bool:
+    marker = read_json(sort_marker_path(path), {}) or {}
+    if marker.get("sort_version") != 1:
+        return False
+    marker_file = marker.get("file")
+    if not marker_file or Path(marker_file).resolve() != path.resolve():
+        return False
+    try:
+        stat = path.stat()
+    except OSError:
+        return False
+    return (
+        marker.get("file_size") == stat.st_size
+        and marker.get("file_mtime_ns") == stat.st_mtime_ns
+    )
+
+
+def write_sort_marker(path: Path, command: list[str]) -> None:
+    stat = path.stat()
+    write_json(
+        sort_marker_path(path),
+        {
+            "sort_version": 1,
+            "file": str(path.resolve()),
+            "file_size": stat.st_size,
+            "file_mtime_ns": stat.st_mtime_ns,
+            "sorted_at": datetime.now(timezone.utc).isoformat(),
+            "command": command,
+        },
+    )
+
+
+def sort_cloudwatch_exports(
+    out: Path,
+    chunk_size: str = "512mb",
+    tmpdir: str | None = None,
+    dedupe: bool = True,
+) -> None:
+    cloudwatch_dir = (out / "cloudwatch").resolve()
+    if not cloudwatch_dir.is_dir():
+        progress("[*] No CloudWatch export directory found; skipping sort")
+        return
+
+    sort_script = Path(__file__).with_name("sort.py")
+    if not sort_script.exists():
+        raise FileNotFoundError(f"Could not find sort script: {sort_script}")
+
+    jsonl_files = [
+        path.resolve()
+        for path in sorted(cloudwatch_dir.glob("*.jsonl"))
+        if path.is_file() and not path.name.endswith("_sorted.jsonl")
+    ]
+    if not jsonl_files:
+        progress("[*] No CloudWatch JSONL files found to sort")
+        return
+
+    progress("[*] Sorting CloudWatch JSONL exports")
+    for path in jsonl_files:
+        if sort_marker_matches(path):
+            progress(f"    Already sorted; skipping {path}")
+            continue
+
+        command = [
+            sys.executable,
+            str(sort_script),
+            str(path),
+            "--replace",
+            "--chunk-size",
+            chunk_size,
+        ]
+        if tmpdir:
+            command.extend(["--tmpdir", tmpdir])
+        if dedupe:
+            command.append("--dedupe")
+
+        progress(f"    Sorting {path}")
+        result = subprocess.run(command)
+        if result.returncode != 0:
+            raise SystemExit(result.returncode)
+
+        write_sort_marker(path, command)
 
 
 def export_waf(out, region):
@@ -846,6 +935,10 @@ def main():
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--cloudtrail", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--resume-overlap-minutes", type=int, default=10)
+    parser.add_argument("--sort-cloudwatch", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--sort-chunk-size", default=os.environ.get("SORT_CHUNK_SIZE", "2048mb"))
+    parser.add_argument("--sort-tmpdir", default=os.environ.get("SORT_TMPDIR"))
+    parser.add_argument("--sort-dedupe", action=argparse.BooleanOptionalAction, default=True)
     args = parser.parse_args()
 
     out = Path(args.out or f"aws_web_traffic_export_{datetime.now().strftime('%Y%m%d')}")
@@ -875,6 +968,16 @@ def main():
             if bucket:
                 download_s3_prefix(out, args.region, bucket, prefix, f"alb_{bucket}_{prefix}")
 
+    if args.sort_cloudwatch:
+        sort_cloudwatch_exports(
+            out,
+            chunk_size=args.sort_chunk_size,
+            tmpdir=args.sort_tmpdir,
+            dedupe=args.sort_dedupe,
+        )
+    else:
+        progress("[*] Skipping CloudWatch JSONL sort")
+
     write_json(
         out / "SUMMARY.json",
         {
@@ -883,6 +986,9 @@ def main():
             "days_back": args.days_back,
             "resume_enabled": args.resume,
             "resume_overlap_minutes": args.resume_overlap_minutes,
+            "sort_cloudwatch_enabled": args.sort_cloudwatch,
+            "sort_chunk_size": args.sort_chunk_size,
+            "sort_dedupe": args.sort_dedupe,
             "cloudtrail_enabled": args.cloudtrail,
             "alb_log_locations_found": alb_locations,
             "waf_logging_configs_found": waf_configs,

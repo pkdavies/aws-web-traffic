@@ -2,7 +2,7 @@
 """
 Generate a static yearly web usage monitoring report from AWS traffic evidence.
 
-The script is designed to work with output from extract_aws_web_traffic_evidence.py.
+The script is designed to work with output from extract.py
 It reads AWS WAF CloudWatch JSONL exports, and also understands ALB access logs if
 they have been downloaded into the export directory.
 """
