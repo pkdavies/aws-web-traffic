@@ -22,6 +22,7 @@ from calendar import monthrange
 from collections import Counter, deque
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from functools import lru_cache
 from html import escape
 from ipaddress import ip_address
 from pathlib import Path
@@ -29,18 +30,22 @@ from typing import Iterable
 from urllib.parse import unquote_plus, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from tqdm import tqdm
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
 
 try:
     import orjson
 except ImportError:
-    orjson = None
+    print("[!] Missing required dependency: orjson. Install it with: .venv/bin/pip install orjson", file=sys.stderr)
+    raise SystemExit(1)
 
 
 DEFAULT_TITLE = "Yearly Web Usage Statistics"
 EXPORT_PREFIX = "aws_web_traffic_export_"
-JSON_PARSER = "orjson" if orjson else "json"
-JSON_DECODE_ERRORS = (json.JSONDecodeError, orjson.JSONDecodeError) if orjson else (json.JSONDecodeError,)
+JSON_PARSER = "orjson"
+JSON_DECODE_ERRORS = (orjson.JSONDecodeError,)
 UUID_PATH_PART_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
     re.I,
@@ -99,6 +104,39 @@ class ParsedFile:
     errors: int = 0
 
 
+@dataclass(slots=True)
+class PreparedEvent:
+    timestamp: datetime | None
+    day: str
+    hour: str
+    hour_of_day: str
+    weekday: str
+    source: str
+    action: str
+    status: str
+    status_class: str
+    method: str
+    host: str
+    path: str
+    normalized_path: str
+    content_type: str
+    country: str
+    client_ip: str
+    user_agent: str
+    device: str
+    browser: str
+    os_name: str
+    referrer: str
+    referrer_host: str
+    query_keys: tuple[str, ...]
+    waf_rule: str
+    waf_labels: tuple[str, ...]
+    bytes_sent: int
+    bytes_received: int
+    sample: dict
+    blocked: bool
+
+
 @dataclass
 class UsageStats:
     name: str
@@ -139,94 +177,74 @@ class UsageStats:
     recent_blocked_events: deque[dict] = field(default_factory=lambda: deque(maxlen=20))
 
     def add(self, event: dict) -> None:
+        self.add_prepared(prepare_usage_event(event))
+
+    def add_prepared(self, event: PreparedEvent, detailed: bool = True) -> None:
         self.total += 1
 
-        dt = event.get("timestamp")
+        dt = event.timestamp
         if dt:
             self.first_seen = dt if self.first_seen is None else min(self.first_seen, dt)
             self.last_seen = dt if self.last_seen is None else max(self.last_seen, dt)
-            self.daily[dt.date().isoformat()] += 1
-            self.hourly[dt.strftime("%Y-%m-%d %H:00")] += 1
-            self.hour_of_day[f"{dt.hour:02d}:00"] += 1
-            self.weekdays[dt.strftime("%a")] += 1
+            self.daily[event.day] += 1
+            self.hour_of_day[event.hour_of_day] += 1
+            self.weekdays[event.weekday] += 1
+            if detailed:
+                self.hourly[event.hour] += 1
 
-        source = clean_value(event.get("source"), "Unknown")
-        self.sources[source] += 1
+        if detailed:
+            self.sources[event.source] += 1
 
-        action = clean_value(event.get("action"), "Observed")
-        if action:
-            self.actions[action] += 1
+        if event.action:
+            self.actions[event.action] += 1
 
-        status = clean_value(event.get("status_code"), "")
-        if status and status != "-":
-            self.statuses[status] += 1
-            self.status_classes[status_class(status)] += 1
+        if event.status:
+            self.statuses[event.status] += 1
+            if detailed:
+                self.status_classes[event.status_class] += 1
 
-        method = clean_value(event.get("method"), "UNKNOWN")
-        self.methods[method] += 1
+        if detailed:
+            self.methods[event.method] += 1
+            self.hosts[event.host] += 1
+            self.paths[event.path] += 1
+            self.content_types[event.content_type] += 1
 
-        host = clean_value(event.get("host"), "Unknown")
-        self.hosts[host] += 1
+        self.normalized_paths[event.normalized_path] += 1
+        self.countries[event.country] += 1
 
-        path = clean_path(event.get("path"))
-        normalized_path = normalize_path_for_grouping(path)
-        self.paths[path] += 1
-        self.normalized_paths[normalized_path] += 1
-        self.content_types[classify_content_type(path)] += 1
+        if event.client_ip:
+            self.unique_ips.add(event.client_ip)
+            if detailed:
+                self.client_ips[event.client_ip] += 1
 
-        country = clean_value(event.get("country"), "Unknown")
-        self.countries[country] += 1
+        if detailed:
+            self.user_agents[event.user_agent] += 1
+            self.devices[event.device] += 1
+            self.browsers[event.browser] += 1
+            self.operating_systems[event.os_name] += 1
+            self.referrers[event.referrer or "Direct / none"] += 1
+        self.referrer_hosts[event.referrer_host] += 1
 
-        ip = clean_value(event.get("client_ip"), "")
-        if ip:
-            self.unique_ips.add(ip)
-            self.client_ips[ip] += 1
+        if detailed:
+            for key in event.query_keys:
+                self.query_keys[key] += 1
 
-        user_agent = clean_value(event.get("user_agent"), "Unknown")
-        device, browser, os_name = classify_user_agent(user_agent)
-        self.user_agents[user_agent] += 1
-        self.devices[device] += 1
-        self.browsers[browser] += 1
-        self.operating_systems[os_name] += 1
+            if event.waf_rule:
+                self.waf_rules[event.waf_rule] += 1
 
-        referrer = clean_value(event.get("referrer"), "")
-        referrer_host = referrer_bucket(referrer, host)
-        self.referrers[referrer or "Direct / none"] += 1
-        self.referrer_hosts[referrer_host] += 1
+            for label in event.waf_labels:
+                self.waf_labels[label] += 1
 
-        for key in event.get("query_keys") or []:
-            self.query_keys[key] += 1
+            self.bytes_sent += event.bytes_sent
+            self.bytes_received += event.bytes_received
+            self.recent_events.append(event.sample)
 
-        rule = clean_value(event.get("waf_rule"), "")
-        if rule:
-            self.waf_rules[rule] += 1
-
-        for label in event.get("waf_labels") or []:
-            self.waf_labels[label] += 1
-
-        self.bytes_sent += safe_int(event.get("bytes_sent"))
-        self.bytes_received += safe_int(event.get("bytes_received"))
-
-        sample = {
-            "time": format_datetime(dt) if dt else "",
-            "source": source,
-            "action": action,
-            "status": status,
-            "method": method,
-            "host": host,
-            "path": path,
-            "country": country,
-            "client_ip": ip,
-            "rule": rule,
-        }
-        self.recent_events.append(sample)
-
-        if is_blocked_event(event):
-            self.blocked_paths[path] += 1
-            self.blocked_countries[country] += 1
-            if ip:
-                self.blocked_ips[ip] += 1
-            self.recent_blocked_events.append(sample)
+            if event.blocked:
+                self.blocked_paths[event.path] += 1
+                self.blocked_countries[event.country] += 1
+                if event.client_ip:
+                    self.blocked_ips[event.client_ip] += 1
+                self.recent_blocked_events.append(event.sample)
 
 
 def month_key(dt: datetime | None) -> str:
@@ -270,12 +288,89 @@ def month_keys_between(first_seen: datetime | None, last_seen: datetime | None) 
     return keys
 
 
+def prepare_usage_event(event: dict) -> PreparedEvent:
+    dt = event.get("timestamp")
+    source = clean_value(event.get("source"), "Unknown")
+    action = clean_value(event.get("action"), "Observed")
+    status = clean_value(event.get("status_code"), "")
+    method = clean_value(event.get("method"), "UNKNOWN")
+    host = clean_value(event.get("host"), "Unknown")
+    path = clean_path(event.get("path"))
+    normalized_path = normalize_path_for_grouping(path)
+    country = clean_value(event.get("country"), "Unknown")
+    client_ip = clean_value(event.get("client_ip"), "")
+    user_agent = clean_value(event.get("user_agent"), "Unknown")
+    device, browser, os_name = classify_user_agent(user_agent)
+    referrer = clean_value(event.get("referrer"), "")
+    referrer_host = referrer_bucket(referrer, host)
+    waf_rule = clean_value(event.get("waf_rule"), "")
+    waf_labels = tuple(event.get("waf_labels") or ())
+    status_bucket = status_class(status) if status else ""
+
+    sample = {
+        "time": dt,
+        "source": source,
+        "action": action,
+        "status": status,
+        "method": method,
+        "host": host,
+        "path": path,
+        "country": country,
+        "client_ip": client_ip,
+        "rule": waf_rule,
+    }
+
+    if dt:
+        day = dt.date().isoformat()
+        hour = dt.strftime("%Y-%m-%d %H:00")
+        hour_of_day = f"{dt.hour:02d}:00"
+        weekday = dt.strftime("%a")
+    else:
+        day = ""
+        hour = ""
+        hour_of_day = ""
+        weekday = ""
+
+    return PreparedEvent(
+        timestamp=dt,
+        day=day,
+        hour=hour,
+        hour_of_day=hour_of_day,
+        weekday=weekday,
+        source=source,
+        action=action,
+        status=status,
+        status_class=status_bucket,
+        method=method,
+        host=host,
+        path=path,
+        normalized_path=normalized_path,
+        content_type=classify_content_type(path),
+        country=country,
+        client_ip=client_ip,
+        user_agent=user_agent,
+        device=device,
+        browser=browser,
+        os_name=os_name,
+        referrer=referrer,
+        referrer_host=referrer_host,
+        query_keys=tuple(event.get("query_keys") or ()),
+        waf_rule=waf_rule,
+        waf_labels=waf_labels,
+        bytes_sent=safe_int(event.get("bytes_sent")),
+        bytes_received=safe_int(event.get("bytes_received")),
+        sample=sample,
+        blocked=is_blocked_event(event),
+    )
+
+
 def add_event(stats: UsageStats, monthly: dict[str, UsageStats], event: dict) -> None:
-    stats.add(event)
-    key = month_key(event.get("timestamp"))
+    prepared = prepare_usage_event(event)
+    stats.add_prepared(prepared)
+    key = month_key(prepared.timestamp)
     if key not in monthly:
         monthly[key] = UsageStats(month_label(key))
-    monthly[key].add(event)
+    monthly[key].add_prepared(prepared, detailed=False)
 
 
 def clean_value(value, default: str = "") -> str:
@@ -358,7 +453,6 @@ class FileProgress:
 
         self.total_bytes = None if path.suffix.lower() == ".gz" else path.stat().st_size
         self.byte_mode = self.total_bytes is not None
-        self.update_step = 4 * 1024 * 1024 if self.byte_mode else 1000
 
     def __enter__(self) -> "FileProgress":
         if not self.enabled:
@@ -407,20 +501,15 @@ class FileProgress:
             return
 
         now = time.monotonic()
+        if not force and now - self.last_report_at < self.interval:
+            return
+
         if self.bar is not None:
-            if (
-                not force
-                and self.pending_units < self.update_step
-                and now - self.last_report_at < self.interval
-            ):
-                return
             if self.pending_units:
                 self.bar.update(self.pending_units)
                 self.pending_units = 0
             self.bar.set_postfix_str(self.summary(include_position=False))
         else:
-            if not force and now - self.last_report_at < self.interval:
-                return
             progress_message(f"{self.label}: {self.path.name} | {self.summary()}")
 
         self.last_report_at = now
@@ -472,29 +561,29 @@ def status_class(status: str) -> str:
 def clean_path(value) -> str:
     path = clean_value(value, "/")
     if path.startswith("http://") or path.startswith("https://"):
-        parsed = urlparse(path)
-        path = parsed.path or "/"
+        try:
+            parsed = urlparse(path)
+            path = parsed.path or "/"
+        except ValueError:
+            path = "/"
     path = path.split("?", 1)[0] or "/"
     if not path.startswith("/"):
         path = "/" + path
     return path
 
 
+@lru_cache(maxsize=262_144)
 def normalize_path_for_grouping(path: str) -> str:
-    path = clean_path(path)
+    if not isinstance(path, str) or not path.startswith("/"):
+        path = clean_path(path)
     if path != "/" and path.endswith("/"):
         path = path.rstrip("/")
 
-    uuid_re = re.compile(
-        r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-        re.I,
-    )
-    long_hex_re = re.compile(r"^[0-9a-f]{16,}$", re.I)
     parts = []
     for part in path.strip("/").split("/"):
         if not part:
             continue
-        if part.isdigit() or uuid_re.match(part) or long_hex_re.match(part):
+        if part.isdigit() or UUID_PATH_PART_RE.match(part) or LONG_HEX_PATH_PART_RE.match(part):
             parts.append(":id")
         elif len(part) > 80:
             parts.append(":value")
@@ -503,9 +592,12 @@ def normalize_path_for_grouping(path: str) -> str:
     return "/" + "/".join(parts) if parts else "/"
 
 
+@lru_cache(maxsize=262_144)
 def classify_content_type(path: str) -> str:
-    lower = clean_path(path).lower()
-    suffix = Path(lower).suffix
+    lower = path.lower()
+    filename = lower.rsplit("/", 1)[-1]
+    dot_index = filename.rfind(".")
+    suffix = filename[dot_index:] if dot_index >= 0 else ""
     if lower.startswith("/api/") or lower == "/api":
         return "API"
     if suffix in {".html", ".htm", ".php", ".aspx"} or not suffix:
@@ -521,28 +613,14 @@ def classify_content_type(path: str) -> str:
     return "Other"
 
 
+@lru_cache(maxsize=16_384)
 def classify_user_agent(user_agent: str) -> tuple[str, str, str]:
     ua = (user_agent or "").strip()
     low = ua.lower()
     if not ua or ua == "Unknown":
         return "Unknown", "Unknown", "Unknown"
 
-    bot_markers = [
-        "bot",
-        "crawl",
-        "spider",
-        "slurp",
-        "nmap",
-        "curl",
-        "wget",
-        "python-requests",
-        "go-http-client",
-        "java/",
-        "httpclient",
-        "scrapy",
-        "scanner",
-    ]
-    is_bot = any(marker in low for marker in bot_markers)
+    is_bot = any(marker in low for marker in BOT_MARKERS)
 
     if is_bot:
         device = "Bot / automation"
@@ -592,6 +670,7 @@ def classify_user_agent(user_agent: str) -> tuple[str, str, str]:
     return device, browser, os_name
 
 
+@lru_cache(maxsize=65_536)
 def referrer_bucket(referrer: str, request_host: str) -> str:
     if not referrer:
         return "Direct / none"
@@ -621,9 +700,19 @@ def load_timezone(name: str) -> ZoneInfo:
         return ZoneInfo("UTC")
 
 
+def json_loads(value):
+    return orjson.loads(value)
+
+
 def timestamp_to_datetime(value, tz: ZoneInfo) -> datetime | None:
     if value is None:
         return None
+    if isinstance(value, (int, float)):
+        numeric = value
+        if numeric > 10_000_000_000:
+            numeric = numeric / 1000
+        return datetime.fromtimestamp(numeric, timezone.utc).astimezone(tz)
+
     try:
         numeric = float(value)
     except (TypeError, ValueError):
@@ -636,6 +725,41 @@ def timestamp_to_datetime(value, tz: ZoneInfo) -> datetime | None:
     if numeric > 10_000_000_000:
         numeric = numeric / 1000
     return datetime.fromtimestamp(numeric, timezone.utc).astimezone(tz)
+
+
+def query_key_names(query: str) -> tuple[str, ...]:
+    if not query:
+        return ()
+
+    keys = set()
+    for part in query.split("&"):
+        if not part:
+            continue
+        key = part.split("=", 1)[0]
+        if key:
+            keys.add(unquote_plus(key))
+    return tuple(sorted(keys))
+
+
+def header_lookup(headers: list[dict]) -> dict[str, str]:
+    lookup: dict[str, str] = {}
+    for header in headers or []:
+        if not isinstance(header, dict):
+            continue
+        name = header.get("name")
+        if not name:
+            continue
+        value = header.get("value", "")
+        lookup[str(name).lower()] = str(value).strip()
+    return lookup
+
+
+def header_value(headers: dict[str, str], *names: str) -> str:
+    for name in names:
+        value = headers.get(name.lower(), "")
+        if value:
+            return value
+    return ""
 
 
 def get_header(headers: list[dict], *names: str) -> str:
@@ -667,12 +791,12 @@ def anonymize_ip(value: str) -> str:
     return ":".join(expanded[:4] + ["0000", "0000", "0000", "0000"])
 
 
-def selected_client_ip(request: dict, headers: list[dict], anonymize: bool) -> str:
+def selected_client_ip(request: dict, headers: dict[str, str], anonymize: bool) -> str:
     candidates = [
-        get_header(headers, "cf-connecting-ip"),
-        get_header(headers, "true-client-ip"),
-        get_header(headers, "x-real-ip"),
-        first_forwarded_ip(get_header(headers, "x-forwarded-for")),
+        headers.get("cf-connecting-ip", ""),
+        headers.get("true-client-ip", ""),
+        headers.get("x-real-ip", ""),
+        first_forwarded_ip(headers.get("x-forwarded-for", "")),
         request.get("clientIp", ""),
     ]
     for candidate in candidates:
@@ -705,21 +829,21 @@ def waf_event_from_payload(
     if not isinstance(request, dict):
         return None
 
-    headers = request.get("headers") or []
+    headers = header_lookup(request.get("headers") or [])
     timestamp = timestamp_to_datetime(payload.get("timestamp", outer_timestamp), tz)
-    host = clean_value(request.get("host"), get_header(headers, "host") or "Unknown")
-    referrer = get_header(headers, "referer", "referrer")
+    host = clean_value(request.get("host"), header_value(headers, "host") or "Unknown")
+    referrer = header_value(headers, "referer", "referrer")
     args = clean_value(request.get("args"), "")
-    query_keys = sorted(parse_qs(args, keep_blank_values=True).keys()) if args else []
+    query_keys = query_key_names(args)
 
-    country = clean_value(get_header(headers, "cf-ipcountry"), "")
+    country = clean_value(header_value(headers, "cf-ipcountry"), "")
     if not country or country == "XX":
         country = clean_value(request.get("country"), "Unknown")
 
     labels = [
-        clean_value(item.get("name"), "")
+        name
         for item in payload.get("labels") or []
-        if isinstance(item, dict) and clean_value(item.get("name"), "")
+        if isinstance(item, dict) and (name := clean_value(item.get("name"), ""))
     ]
 
     return {
@@ -731,7 +855,7 @@ def waf_event_from_payload(
         "path": clean_path(request.get("uri")),
         "country": country,
         "client_ip": selected_client_ip(request, headers, anonymize),
-        "user_agent": get_header(headers, "user-agent") or "Unknown",
+        "user_agent": header_value(headers, "user-agent") or "Unknown",
         "referrer": referrer,
         "query_keys": query_keys,
         "waf_rule": waf_terminating_rule(payload),
@@ -741,13 +865,13 @@ def waf_event_from_payload(
 
 
 def parse_cloudwatch_waf_line(
-    line: str,
+    line: str | bytes,
     tz: ZoneInfo,
     anonymize: bool,
 ) -> dict | None:
     try:
-        outer = json.loads(line)
-    except json.JSONDecodeError:
+        outer = json_loads(line)
+    except JSON_DECODE_ERRORS:
         return None
 
     if not isinstance(outer, dict):
@@ -761,8 +885,8 @@ def parse_cloudwatch_waf_line(
         return None
 
     try:
-        payload = json.loads(message)
-    except json.JSONDecodeError:
+        payload = json_loads(message)
+    except JSON_DECODE_ERRORS:
         return None
 
     if not isinstance(payload, dict):
@@ -781,7 +905,9 @@ def split_host_port(value: str) -> str:
     return value
 
 
-def parse_alb_line(line: str, tz: ZoneInfo, anonymize: bool) -> dict | None:
+def parse_alb_line(line: str | bytes, tz: ZoneInfo, anonymize: bool) -> dict | None:
+    if isinstance(line, bytes):
+        line = line.decode("utf-8", errors="replace")
     try:
         fields = shlex.split(line)
     except ValueError:
@@ -803,10 +929,15 @@ def parse_alb_line(line: str, tz: ZoneInfo, anonymize: bool) -> dict | None:
         method = "UNKNOWN"
         raw_url = "/"
 
-    parsed_url = urlparse(raw_url)
-    host = parsed_url.netloc or clean_value(fields[2], "Unknown")
-    path = parsed_url.path or "/"
-    query_keys = sorted(parse_qs(parsed_url.query, keep_blank_values=True).keys())
+    try:
+        parsed_url = urlparse(raw_url)
+        host = parsed_url.netloc or clean_value(fields[2], "Unknown")
+        path = parsed_url.path or "/"
+        query_keys = query_key_names(parsed_url.query)
+    except ValueError:
+        host = clean_value(fields[2], "Unknown")
+        path = "/"
+        query_keys = ()
 
     elb_status = clean_value(fields[8], "")
     target_status = clean_value(fields[9], "")
@@ -837,18 +968,24 @@ def is_blocked_event(event: dict) -> bool:
     return status.startswith("4") or status.startswith("5")
 
 
-def iter_progress_lines(path: Path, progress: FileProgress) -> Iterable[str]:
+def iter_progress_lines(path: Path, progress: FileProgress) -> Iterable[str | bytes]:
     if path.suffix.lower() == ".gz":
         with gzip.open(path, "rt", encoding="utf-8", errors="replace") as handle:
-            for line in handle:
-                progress.observe_line(line)
-                yield line
+            if progress.enabled:
+                for line in handle:
+                    progress.observe_line(line)
+                    yield line
+            else:
+                yield from handle
         return
 
     with path.open("rb") as handle:
-        for line in handle:
-            progress.observe_line(line)
-            yield line.decode("utf-8", errors="replace")
+        if progress.enabled:
+            for line in handle:
+                progress.observe_line(line)
+                yield line
+        else:
+            yield from handle
 
 
 def find_latest_export_dir(cwd: Path) -> Path | None:
@@ -1192,9 +1329,12 @@ def event_table(events: Iterable[dict], empty_message: str) -> str:
     body = []
     for event in reversed(rows):
         outcome = event.get("status") or event.get("action") or ""
+        event_time = event.get("time", "")
+        if isinstance(event_time, datetime):
+            event_time = format_datetime(event_time)
         body.append(
             "<tr>"
-            f"<td>{html_escape(event.get('time', ''))}</td>"
+            f"<td>{html_escape(event_time)}</td>"
             f"<td>{html_escape(outcome)}</td>"
             f"<td>{html_escape(event.get('method', ''))}</td>"
             f"<td title=\"{html_escape(event.get('path', ''))}\">{html_escape(truncate(event.get('path', ''), 80))}</td>"
@@ -2028,6 +2168,7 @@ def main() -> int:
     show_progress = args.progress and args.progress_interval > 0
 
     print(f"[*] Reading evidence from {export_dir}", flush=True)
+    print(f"[*] JSON parser: {JSON_PARSER}", flush=True)
     waf_stats, waf_monthly, waf_files = load_waf_stats(
         export_dir,
         tz,
