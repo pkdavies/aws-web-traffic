@@ -26,14 +26,41 @@ from html import escape
 from ipaddress import ip_address
 from pathlib import Path
 from typing import Iterable
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import unquote_plus, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from tqdm import tqdm
 
+try:
+    import orjson
+except ImportError:
+    orjson = None
+
 
 DEFAULT_TITLE = "Yearly Web Usage Statistics"
 EXPORT_PREFIX = "aws_web_traffic_export_"
+JSON_PARSER = "orjson" if orjson else "json"
+JSON_DECODE_ERRORS = (json.JSONDecodeError, orjson.JSONDecodeError) if orjson else (json.JSONDecodeError,)
+UUID_PATH_PART_RE = re.compile(
+    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+    re.I,
+)
+LONG_HEX_PATH_PART_RE = re.compile(r"^[0-9a-f]{16,}$", re.I)
+BOT_MARKERS = (
+    "bot",
+    "crawl",
+    "spider",
+    "slurp",
+    "nmap",
+    "curl",
+    "wget",
+    "python-requests",
+    "go-http-client",
+    "java/",
+    "httpclient",
+    "scrapy",
+    "scanner",
+)
 STATIC_EXTENSIONS = {
     ".avif",
     ".bmp",
