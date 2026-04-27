@@ -175,19 +175,30 @@ def existing_cloudwatch_state(summary_path: Path, outfile: Path, overlap_ms: int
 
     if (
         summary.get("resume_version") == 1
-        and summary.get("completed") is True
         and summary.get("output_file_size") == current_size
         and (
-            summary.get("covered_end_timestamp_ms") is not None
+            summary.get("last_event_timestamp_ms") is not None
+            or summary.get("covered_end_timestamp_ms") is not None
             or summary.get("requested_end") is not None
         )
     ):
+        completed = summary.get("completed") is True
         covered_start_ms = summary.get("covered_start_timestamp_ms")
         covered_end_ms = summary.get("covered_end_timestamp_ms")
         if covered_start_ms is None:
             covered_start_ms = iso_to_ms(summary.get("requested_start"))
         if covered_end_ms is None:
             covered_end_ms = iso_to_ms(summary.get("requested_end"))
+
+        if not completed:
+            covered_end_ms = summary.get("last_event_timestamp_ms") or covered_end_ms
+
+        progress(
+            "    Using existing CloudWatch summary checkpoint: "
+            f"records={int(summary.get('events_exported_total', 0)):,}, "
+            f"completed={completed}, "
+            f"resume_from={iso_from_ms(covered_end_ms or summary.get('last_event_timestamp_ms'))}"
+        )
 
         return {
             "records": int(summary.get("events_exported_total", 0)),
@@ -196,7 +207,7 @@ def existing_cloudwatch_state(summary_path: Path, outfile: Path, overlap_ms: int
             "last_timestamp_ms": summary.get("last_event_timestamp_ms"),
             "covered_start_ms": covered_start_ms or summary.get("first_event_timestamp_ms"),
             "covered_end_ms": covered_end_ms or summary.get("last_event_timestamp_ms"),
-            "coverage_reliable": True,
+            "coverage_reliable": completed,
             "early_event_ids": set(),
             "late_event_ids": set(),
             "from_summary": True,
