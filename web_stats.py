@@ -17,6 +17,7 @@ import os
 import re
 import shlex
 import sys
+import time
 from calendar import monthrange
 from collections import Counter, deque
 from dataclasses import dataclass, field
@@ -27,6 +28,11 @@ from pathlib import Path
 from typing import Iterable
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
 
 
 DEFAULT_TITLE = "Yearly Web Usage Statistics"
@@ -291,6 +297,140 @@ def fmt_bytes(value: int) -> str:
             return f"{size:,.1f} {unit}"
         size /= 1024
     return f"{value:,} B"
+
+
+def fmt_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m {seconds:02d}s"
+    if minutes:
+        return f"{minutes}m {seconds:02d}s"
+    return f"{seconds}s"
+
+
+def progress_message(message: str) -> None:
+    timestamp = datetime.now().strftime("%H:%M:%S")
+    print(f"[*] {timestamp} {message}", file=sys.stderr, flush=True)
+
+
+class FileProgress:
+    def __init__(self, label: str, path: Path, enabled: bool, interval: float) -> None:
+        self.label = label
+        self.path = path
+        self.enabled = enabled
+        self.interval = max(0.5, interval)
+        self.started_at = time.monotonic()
+        self.last_report_at = self.started_at
+        self.lines = 0
+        self.bytes_seen = 0
+        self.pending_units = 0
+        self.records = 0
+        self.errors = 0
+        self.total_records = 0
+        self.bar = None
+        self.closed = False
+
+        self.total_bytes = None if path.suffix.lower() == ".gz" else path.stat().st_size
+        self.byte_mode = self.total_bytes is not None
+        self.update_step = 4 * 1024 * 1024 if self.byte_mode else 1000
+
+    def __enter__(self) -> "FileProgress":
+        if not self.enabled:
+            return self
+
+        description = f"{self.label}: {self.path.name}"
+        if tqdm is not None:
+            kwargs = {
+                "desc": description,
+                "dynamic_ncols": True,
+                "file": sys.stderr,
+                "leave": True,
+                "mininterval": self.interval,
+            }
+            if self.byte_mode:
+                self.bar = tqdm(
+                    total=self.total_bytes,
+                    unit="B",
+                    unit_divisor=1024,
+                    unit_scale=True,
+                    **kwargs,
+                )
+            else:
+                self.bar = tqdm(unit="line", **kwargs)
+        else:
+            size = f" ({fmt_bytes(self.total_bytes)})" if self.byte_mode else ""
+            progress_message(f"Parsing {description}{size}")
+
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close()
+
+    def observe_line(self, line: str | bytes) -> None:
+        self.lines += 1
+        amount = len(line)
+        self.bytes_seen += amount
+        self.pending_units += amount if self.byte_mode else 1
+
+    def maybe_report(self, parsed: ParsedFile, total_records: int, force: bool = False) -> None:
+        self.records = parsed.records
+        self.errors = parsed.errors
+        self.total_records = total_records
+
+        if not self.enabled:
+            return
+
+        now = time.monotonic()
+        if self.bar is not None:
+            if (
+                not force
+                and self.pending_units < self.update_step
+                and now - self.last_report_at < self.interval
+            ):
+                return
+            if self.pending_units:
+                self.bar.update(self.pending_units)
+                self.pending_units = 0
+            self.bar.set_postfix_str(self.summary(include_position=False))
+        else:
+            if not force and now - self.last_report_at < self.interval:
+                return
+            progress_message(f"{self.label}: {self.path.name} | {self.summary()}")
+
+        self.last_report_at = now
+
+    def finish(self, parsed: ParsedFile, total_records: int) -> None:
+        self.maybe_report(parsed, total_records, force=True)
+        if self.enabled and self.bar is None:
+            progress_message(f"Finished {self.label}: {self.path.name} | {self.summary()}")
+        self.close()
+
+    def close(self) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        if self.bar is not None:
+            self.bar.close()
+
+    def summary(self, include_position: bool = True) -> str:
+        elapsed = max(0.001, time.monotonic() - self.started_at)
+        rate = self.records / elapsed
+        parts = [
+            f"lines={fmt_int(self.lines)}",
+            f"records={fmt_int(self.records)}",
+            f"errors={fmt_int(self.errors)}",
+        ]
+        if include_position:
+            if self.byte_mode:
+                seen = min(self.bytes_seen, self.total_bytes or self.bytes_seen)
+                parts.append(f"read={fmt_bytes(seen)}/{fmt_bytes(self.total_bytes or 0)}")
+                parts.append(f"{pct(seen, self.total_bytes or 0)}")
+            else:
+                parts.append(f"read~{fmt_bytes(self.bytes_seen)}")
+        parts.extend([f"rate={fmt_int(rate)}/s", f"elapsed={fmt_duration(elapsed)}"])
+        return ", ".join(parts)
 
 
 def format_datetime(dt: datetime | None) -> str:
@@ -670,10 +810,18 @@ def is_blocked_event(event: dict) -> bool:
     return status.startswith("4") or status.startswith("5")
 
 
-def open_text(path: Path):
+def iter_progress_lines(path: Path, progress: FileProgress) -> Iterable[str]:
     if path.suffix.lower() == ".gz":
-        return gzip.open(path, "rt", encoding="utf-8", errors="replace")
-    return path.open("r", encoding="utf-8", errors="replace")
+        with gzip.open(path, "rt", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                progress.observe_line(line)
+                yield line
+        return
+
+    with path.open("rb") as handle:
+        for line in handle:
+            progress.observe_line(line)
+            yield line.decode("utf-8", errors="replace")
 
 
 def find_latest_export_dir(cwd: Path) -> Path | None:
@@ -688,28 +836,43 @@ def load_waf_stats(
     tz: ZoneInfo,
     anonymize: bool,
     max_records: int,
+    show_progress: bool = True,
+    progress_interval: float = 5.0,
 ) -> tuple[UsageStats, dict[str, UsageStats], list[ParsedFile]]:
     stats = UsageStats("AWS WAF")
     monthly: dict[str, UsageStats] = {}
     parsed_files: list[ParsedFile] = []
     cloudwatch_dir = export_dir / "cloudwatch"
 
-    for path in sorted(cloudwatch_dir.glob("*.jsonl")):
+    paths = sorted(cloudwatch_dir.glob("*.jsonl"))
+    if show_progress:
+        progress_message(f"Found {fmt_int(len(paths))} CloudWatch JSONL file(s)")
+
+    for path in paths:
+        if max_records and stats.total >= max_records:
+            return stats, monthly, parsed_files
         parsed = ParsedFile(path=path, kind="AWS WAF CloudWatch JSONL")
         parsed_files.append(parsed)
-        with open_text(path) as handle:
-            for line in handle:
-                if max_records and stats.total >= max_records:
-                    return stats, monthly, parsed_files
+        with FileProgress("WAF JSONL", path, show_progress, progress_interval) as progress:
+            for line in iter_progress_lines(path, progress):
                 line = line.strip()
                 if not line:
+                    progress.maybe_report(parsed, stats.total)
                     continue
                 event = parse_cloudwatch_waf_line(line, tz, anonymize)
                 if event is None:
                     parsed.errors += 1
+                    progress.maybe_report(parsed, stats.total)
                     continue
                 parsed.records += 1
                 add_event(stats, monthly, event)
+                progress.maybe_report(parsed, stats.total)
+                if max_records and stats.total >= max_records:
+                    progress.finish(parsed, stats.total)
+                    if show_progress:
+                        progress_message(f"Stopped WAF parsing at --max-records={fmt_int(max_records)}")
+                    return stats, monthly, parsed_files
+            progress.finish(parsed, stats.total)
 
     return stats, monthly, parsed_files
 
@@ -735,6 +898,8 @@ def load_alb_stats(
     tz: ZoneInfo,
     anonymize: bool,
     max_records: int,
+    show_progress: bool = True,
+    progress_interval: float = 5.0,
 ) -> tuple[UsageStats, dict[str, UsageStats], list[ParsedFile]]:
     stats = UsageStats("ALB access logs")
     monthly: dict[str, UsageStats] = {}
@@ -743,21 +908,30 @@ def load_alb_stats(
     for path in sorted(export_dir.rglob("*")):
         if not path.is_file() or not looks_like_alb_log(path, export_dir):
             continue
+        if max_records and stats.total >= max_records:
+            return stats, monthly, parsed_files
         parsed = ParsedFile(path=path, kind="ALB access log")
         parsed_files.append(parsed)
-        with open_text(path) as handle:
-            for line in handle:
-                if max_records and stats.total >= max_records:
-                    return stats, monthly, parsed_files
+        with FileProgress("ALB log", path, show_progress, progress_interval) as progress:
+            for line in iter_progress_lines(path, progress):
                 line = line.strip()
                 if not line:
+                    progress.maybe_report(parsed, stats.total)
                     continue
                 event = parse_alb_line(line, tz, anonymize)
                 if event is None:
                     parsed.errors += 1
+                    progress.maybe_report(parsed, stats.total)
                     continue
                 parsed.records += 1
                 add_event(stats, monthly, event)
+                progress.maybe_report(parsed, stats.total)
+                if max_records and stats.total >= max_records:
+                    progress.finish(parsed, stats.total)
+                    if show_progress:
+                        progress_message(f"Stopped ALB parsing at --max-records={fmt_int(max_records)}")
+                    return stats, monthly, parsed_files
+            progress.finish(parsed, stats.total)
 
     return stats, monthly, parsed_files
 
@@ -1795,6 +1969,18 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Optional maximum records per source to parse. 0 means no limit.",
     )
+    parser.add_argument(
+        "--progress",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Show per-file parsing progress. Uses tqdm progress bars when tqdm is installed.",
+    )
+    parser.add_argument(
+        "--progress-interval",
+        type=float,
+        default=5.0,
+        help="Seconds between progress refreshes. Set to 0 to disable progress output.",
+    )
     return parser.parse_args()
 
 
@@ -1812,12 +1998,27 @@ def main() -> int:
 
     tz = load_timezone(args.timezone)
     out = Path(args.out).expanduser().resolve() if args.out else export_dir / "web_stats.html"
+    show_progress = args.progress and args.progress_interval > 0
 
-    print(f"[*] Reading evidence from {export_dir}")
-    waf_stats, waf_monthly, waf_files = load_waf_stats(export_dir, tz, args.anonymize_ips, args.max_records)
-    print(f"[*] Parsed WAF records: {fmt_int(waf_stats.total)}")
-    alb_stats, alb_monthly, alb_files = load_alb_stats(export_dir, tz, args.anonymize_ips, args.max_records)
-    print(f"[*] Parsed ALB records: {fmt_int(alb_stats.total)}")
+    print(f"[*] Reading evidence from {export_dir}", flush=True)
+    waf_stats, waf_monthly, waf_files = load_waf_stats(
+        export_dir,
+        tz,
+        args.anonymize_ips,
+        args.max_records,
+        show_progress=show_progress,
+        progress_interval=args.progress_interval,
+    )
+    print(f"[*] Parsed WAF records: {fmt_int(waf_stats.total)}", flush=True)
+    alb_stats, alb_monthly, alb_files = load_alb_stats(
+        export_dir,
+        tz,
+        args.anonymize_ips,
+        args.max_records,
+        show_progress=show_progress,
+        progress_interval=args.progress_interval,
+    )
+    print(f"[*] Parsed ALB records: {fmt_int(alb_stats.total)}", flush=True)
 
     primary = waf_stats if waf_stats.total else alb_stats
     primary_monthly = waf_monthly if waf_stats.total else alb_monthly
@@ -1838,7 +2039,7 @@ def main() -> int:
         anonymized=args.anonymize_ips,
     )
     write_report(out, html)
-    print(f"[+] Wrote report: {out}")
+    print(f"[+] Wrote report: {out}", flush=True)
     return 0
 
 
