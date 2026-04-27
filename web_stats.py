@@ -29,10 +29,7 @@ from typing import Iterable
 from urllib.parse import parse_qs, urlparse
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-try:
-    from tqdm import tqdm
-except ImportError:
-    tqdm = None
+from tqdm import tqdm
 
 
 DEFAULT_TITLE = "Yearly Web Usage Statistics"
@@ -571,7 +568,10 @@ def classify_user_agent(user_agent: str) -> tuple[str, str, str]:
 def referrer_bucket(referrer: str, request_host: str) -> str:
     if not referrer:
         return "Direct / none"
-    parsed = urlparse(referrer)
+    try:
+        parsed = urlparse(referrer)
+    except ValueError:
+        return "Unknown / malformed"
     if not parsed.netloc:
         return "Unknown / malformed"
     if request_host and parsed.netloc.lower() == request_host.lower():

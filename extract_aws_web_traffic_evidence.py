@@ -769,9 +769,10 @@ def export_ecs(out, region):
                 write_json(out / "ecs" / f"task_definition_{safe_name(td)}.json", td_detail)
 
 
-def export_cloudtrail(out, region, days_back):
+def export_cloudtrail(out, region, days_back, resume=True):
     ct = client("cloudtrail", region)
-    start = datetime.now(timezone.utc) - timedelta(days=days_back)
+    cloudtrail_days = int(os.environ.get("CT_DAYS_BACK", min(days_back, 90)))
+    start = datetime.now(timezone.utc) - timedelta(days=cloudtrail_days)
     end = datetime.now(timezone.utc)
 
     sources = [
@@ -784,6 +785,11 @@ def export_cloudtrail(out, region, days_back):
     ]
 
     for source in sources:
+        outfile = out / "cloudtrail" / f"{safe_name(source)}.json"
+        if resume and outfile.exists() and outfile.stat().st_size > 0:
+            progress(f"[*] CloudTrail lookup {source} already exists; skipping")
+            continue
+
         events = try_call(
             f"CloudTrail lookup {source}",
             lambda source=source: paginate(
@@ -798,7 +804,7 @@ def export_cloudtrail(out, region, days_back):
             ),
             [],
         )
-        write_json(out / "cloudtrail" / f"{safe_name(source)}.json", events)
+        write_json(outfile, events)
 
 
 def export_s3_inventory(out, region):
@@ -838,6 +844,7 @@ def main():
     parser.add_argument("--out", default=None)
     parser.add_argument("--download-alb-logs", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--resume", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--cloudtrail", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--resume-overlap-minutes", type=int, default=10)
     args = parser.parse_args()
 
@@ -855,7 +862,10 @@ def main():
         resume_overlap_minutes=args.resume_overlap_minutes,
     )
     export_ecs(out, args.region)
-    export_cloudtrail(out, args.region, args.days_back)
+    if args.cloudtrail:
+        export_cloudtrail(out, args.region, args.days_back, resume=args.resume)
+    else:
+        progress("[*] Skipping CloudTrail lookup")
     export_s3_inventory(out, args.region)
 
     if args.download_alb_logs:
@@ -873,6 +883,7 @@ def main():
             "days_back": args.days_back,
             "resume_enabled": args.resume,
             "resume_overlap_minutes": args.resume_overlap_minutes,
+            "cloudtrail_enabled": args.cloudtrail,
             "alb_log_locations_found": alb_locations,
             "waf_logging_configs_found": waf_configs,
             "notes": [

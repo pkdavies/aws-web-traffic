@@ -381,7 +381,10 @@ def classify_user_agent(user_agent: str) -> tuple[str, str, str]:
 def referrer_bucket(referrer: str, request_host: str) -> str:
     if not referrer:
         return "Direct / none"
-    parsed = urlparse(referrer)
+    try:
+        parsed = urlparse(referrer)
+    except ValueError:
+        return "Unknown / malformed"
     if not parsed.netloc:
         return "Unknown / malformed"
     if request_host and parsed.netloc.lower() == request_host.lower():
