@@ -1,0 +1,17 @@
+{
+  "UserId": "AROAVIFFBPSRQCFWX5CHU:supdavies@mhclg.onmicrosoft.com",
+  "Account": "361123380387",
+  "Arn": "arn:aws:sts::361123380387:assumed-role/AWSReservedSSO_developer_role_85fbd10dabbf02b0/supdavies@mhclg.onmicrosoft.com",
+  "ResponseMetadata": {
+    "RequestId": "9c0edab4-832b-4dab-82be-5d1ffab03c6f",
+    "HTTPStatusCode": 200,
+    "HTTPHeaders": {
+      "x-amzn-requestid": "9c0edab4-832b-4dab-82be-5d1ffab03c6f",
+      "x-amz-sts-extended-request-id": "MTpldS13ZXN0LTI6UzoxNzc3Mjk3MjIwMDQ4OlI6S3lxc2tuZ3c=",
+      "content-type": "text/xml",
+      "content-length": "515",
+      "date": "Mon, 27 Apr 2026 13:40:20 GMT"
+    },
+    "RetryAttempts": 0
+  }
+}
