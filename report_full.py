@@ -66,6 +66,23 @@ BOT_MARKERS = (
     "scrapy",
     "scanner",
 )
+MONITORING_USER_AGENT_MARKERS = (
+    "pingdom",
+    "elb-healthchecker",
+    "healthchecker",
+    "health check",
+    "healthcheck",
+)
+MONITORING_PATHS = {
+    "/health",
+    "/health/",
+    "/healthcheck",
+    "/health-check",
+    "/ping",
+    "/ping/",
+    "/status",
+    "/status/",
+}
 STATIC_EXTENSIONS = {
     ".avif",
     ".bmp",
@@ -101,6 +118,7 @@ class ParsedFile:
     path: Path
     kind: str
     records: int = 0
+    filtered: int = 0
     errors: int = 0
 
 
@@ -122,6 +140,8 @@ class PreparedEvent:
     content_type: str
     country: str
     client_ip: str
+    client_ip_source: str
+    edge_client_ip: str
     user_agent: str
     device: str
     browser: str
@@ -131,6 +151,8 @@ class PreparedEvent:
     query_keys: tuple[str, ...]
     waf_rule: str
     waf_labels: tuple[str, ...]
+    ja3_fingerprint: str
+    ja4_fingerprint: str
     bytes_sent: int
     bytes_received: int
     sample: dict
@@ -168,6 +190,13 @@ class UsageStats:
     waf_rules: Counter = field(default_factory=Counter)
     waf_labels: Counter = field(default_factory=Counter)
     client_ips: Counter = field(default_factory=Counter)
+    client_ip_sources: Counter = field(default_factory=Counter)
+    client_ip_categories: Counter = field(default_factory=Counter)
+    edge_client_ips: Counter = field(default_factory=Counter)
+    ip_user_agent_pairs: Counter = field(default_factory=Counter)
+    ip_user_agents: dict[str, set[str]] = field(default_factory=dict)
+    ja3_fingerprints: Counter = field(default_factory=Counter)
+    ja4_fingerprints: Counter = field(default_factory=Counter)
     blocked_paths: Counter = field(default_factory=Counter)
     blocked_countries: Counter = field(default_factory=Counter)
     blocked_ips: Counter = field(default_factory=Counter)
@@ -216,6 +245,24 @@ class UsageStats:
             self.unique_ips.add(event.client_ip)
             if detailed:
                 self.client_ips[event.client_ip] += 1
+                self.client_ip_categories[ip_address_category(event.client_ip)] += 1
+                if event.client_ip_source:
+                    self.client_ip_sources[event.client_ip_source] += 1
+                if event.user_agent:
+                    pair_key = f"{event.client_ip} | {event.user_agent}"
+                    self.ip_user_agent_pairs[pair_key] += 1
+                    self.ip_user_agents.setdefault(event.client_ip, set()).add(event.user_agent)
+        elif detailed and event.client_ip_source:
+            self.client_ip_sources[event.client_ip_source] += 1
+
+        if detailed and event.edge_client_ip:
+            self.edge_client_ips[event.edge_client_ip] += 1
+
+        if detailed and event.ja3_fingerprint:
+            self.ja3_fingerprints[event.ja3_fingerprint] += 1
+
+        if detailed and event.ja4_fingerprint:
+            self.ja4_fingerprints[event.ja4_fingerprint] += 1
 
         if detailed:
             self.user_agents[event.user_agent] += 1
@@ -299,12 +346,16 @@ def prepare_usage_event(event: dict) -> PreparedEvent:
     normalized_path = normalize_path_for_grouping(path)
     country = clean_value(event.get("country"), "Unknown")
     client_ip = clean_value(event.get("client_ip"), "")
+    client_ip_source = clean_value(event.get("client_ip_source"), "")
+    edge_client_ip = clean_value(event.get("edge_client_ip"), "")
     user_agent = clean_value(event.get("user_agent"), "Unknown")
     device, browser, os_name = classify_user_agent(user_agent)
     referrer = clean_value(event.get("referrer"), "")
     referrer_host = referrer_bucket(referrer, host)
     waf_rule = clean_value(event.get("waf_rule"), "")
     waf_labels = tuple(event.get("waf_labels") or ())
+    ja3_fingerprint = clean_value(event.get("ja3_fingerprint"), "")
+    ja4_fingerprint = clean_value(event.get("ja4_fingerprint"), "")
     status_bucket = status_class(status) if status else ""
 
     sample = {
@@ -317,6 +368,7 @@ def prepare_usage_event(event: dict) -> PreparedEvent:
         "path": path,
         "country": country,
         "client_ip": client_ip,
+        "client_ip_source": client_ip_source,
         "rule": waf_rule,
     }
 
@@ -348,6 +400,8 @@ def prepare_usage_event(event: dict) -> PreparedEvent:
         content_type=classify_content_type(path),
         country=country,
         client_ip=client_ip,
+        client_ip_source=client_ip_source,
+        edge_client_ip=edge_client_ip,
         user_agent=user_agent,
         device=device,
         browser=browser,
@@ -357,6 +411,8 @@ def prepare_usage_event(event: dict) -> PreparedEvent:
         query_keys=tuple(event.get("query_keys") or ()),
         waf_rule=waf_rule,
         waf_labels=waf_labels,
+        ja3_fingerprint=ja3_fingerprint,
+        ja4_fingerprint=ja4_fingerprint,
         bytes_sent=safe_int(event.get("bytes_sent")),
         bytes_received=safe_int(event.get("bytes_received")),
         sample=sample,
@@ -791,19 +847,41 @@ def anonymize_ip(value: str) -> str:
     return ":".join(expanded[:4] + ["0000", "0000", "0000", "0000"])
 
 
-def selected_client_ip(request: dict, headers: dict[str, str], anonymize: bool) -> str:
+def ip_address_category(value: str) -> str:
+    if not value:
+        return "Missing"
+    try:
+        parsed = ip_address(value)
+    except ValueError:
+        return "Invalid"
+    if parsed.is_global:
+        return "Public/global"
+    if parsed.is_private:
+        return "Private/internal"
+    if parsed.is_loopback:
+        return "Loopback"
+    if parsed.is_link_local:
+        return "Link-local"
+    if parsed.is_reserved:
+        return "Reserved"
+    if parsed.is_multicast:
+        return "Multicast"
+    return "Non-global/other"
+
+
+def selected_client_ip(request: dict, headers: dict[str, str], anonymize: bool) -> tuple[str, str]:
     candidates = [
-        headers.get("cf-connecting-ip", ""),
-        headers.get("true-client-ip", ""),
-        headers.get("x-real-ip", ""),
-        first_forwarded_ip(headers.get("x-forwarded-for", "")),
-        request.get("clientIp", ""),
+        ("cf-connecting-ip", headers.get("cf-connecting-ip", "")),
+        ("true-client-ip", headers.get("true-client-ip", "")),
+        ("x-real-ip", headers.get("x-real-ip", "")),
+        ("x-forwarded-for", first_forwarded_ip(headers.get("x-forwarded-for", ""))),
+        ("waf-client-ip", request.get("clientIp", "")),
     ]
-    for candidate in candidates:
+    for source, candidate in candidates:
         candidate = clean_value(candidate, "")
         if candidate:
-            return anonymize_ip(candidate) if anonymize else candidate
-    return ""
+            return (anonymize_ip(candidate) if anonymize else candidate, source)
+    return "", ""
 
 
 def waf_terminating_rule(payload: dict) -> str:
@@ -845,6 +923,10 @@ def waf_event_from_payload(
         for item in payload.get("labels") or []
         if isinstance(item, dict) and (name := clean_value(item.get("name"), ""))
     ]
+    client_ip, client_ip_source = selected_client_ip(request, headers, anonymize)
+    edge_client_ip = clean_value(request.get("clientIp"), "")
+    if anonymize:
+        edge_client_ip = anonymize_ip(edge_client_ip)
 
     return {
         "source": "AWS WAF",
@@ -854,12 +936,16 @@ def waf_event_from_payload(
         "host": host,
         "path": clean_path(request.get("uri")),
         "country": country,
-        "client_ip": selected_client_ip(request, headers, anonymize),
+        "client_ip": client_ip,
+        "client_ip_source": client_ip_source,
+        "edge_client_ip": edge_client_ip,
         "user_agent": header_value(headers, "user-agent") or "Unknown",
         "referrer": referrer,
         "query_keys": query_keys,
         "waf_rule": waf_terminating_rule(payload),
         "waf_labels": labels,
+        "ja3_fingerprint": clean_value(payload.get("ja3Fingerprint"), ""),
+        "ja4_fingerprint": clean_value(payload.get("ja4Fingerprint"), ""),
         "bytes_received": safe_int(payload.get("requestBodySize")),
     }
 
@@ -953,8 +1039,12 @@ def parse_alb_line(line: str | bytes, tz: ZoneInfo, anonymize: bool) -> dict | N
         "path": path,
         "country": "Unknown",
         "client_ip": anonymize_ip(client_ip) if anonymize else client_ip,
+        "client_ip_source": "alb-client",
+        "edge_client_ip": "",
         "user_agent": user_agent or "Unknown",
         "query_keys": query_keys,
+        "ja3_fingerprint": "",
+        "ja4_fingerprint": "",
         "bytes_received": safe_int(fields[10]),
         "bytes_sent": safe_int(fields[11]),
     }
@@ -968,7 +1058,132 @@ def is_blocked_event(event: dict) -> bool:
     return status.startswith("4") or status.startswith("5")
 
 
-def iter_progress_lines(path: Path, progress: FileProgress) -> Iterable[str | bytes]:
+def parse_filter_datetime(value: str | None, tz: ZoneInfo) -> datetime | None:
+    if not value:
+        return None
+
+    text = value.strip()
+    if not text:
+        return None
+
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", text):
+        dt = datetime.fromisoformat(text)
+    else:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        dt = datetime.fromisoformat(text)
+
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=tz)
+    return dt.astimezone(tz)
+
+
+def datetime_to_ms(dt: datetime) -> int:
+    return int(dt.astimezone(timezone.utc).timestamp() * 1000)
+
+
+def line_timestamp_ms(line: str | bytes) -> int | None:
+    try:
+        outer = json_loads(line)
+    except JSON_DECODE_ERRORS:
+        return None
+
+    if not isinstance(outer, dict):
+        return None
+
+    value = outer.get("timestamp")
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def next_full_line(handle, offset: int) -> tuple[int, bytes]:
+    handle.seek(offset)
+    if offset:
+        handle.readline()
+    line_start = handle.tell()
+    return line_start, handle.readline()
+
+
+def seek_jsonl_timestamp(path: Path, target_ms: int) -> int:
+    size = path.stat().st_size
+    lo = 0
+    hi = size
+    best = size
+
+    with path.open("rb") as handle:
+        while lo < hi:
+            mid = (lo + hi) // 2
+            line_start, line = next_full_line(handle, mid)
+            if not line:
+                hi = mid
+                continue
+
+            timestamp_ms = line_timestamp_ms(line)
+            if timestamp_ms is None:
+                lo = handle.tell()
+                continue
+
+            if timestamp_ms < target_ms:
+                lo = handle.tell()
+            else:
+                best = line_start
+                hi = mid
+
+    return best
+
+
+def is_suppressed_log_level_line(line: str | bytes, suppressed_levels: set[str]) -> bool:
+    if not suppressed_levels:
+        return False
+
+    try:
+        outer = json_loads(line)
+    except JSON_DECODE_ERRORS:
+        return False
+
+    if not isinstance(outer, dict):
+        return False
+
+    message = outer.get("message")
+    if not isinstance(message, str):
+        return False
+
+    text = message.lstrip()
+    if not text or text.startswith("{"):
+        return False
+
+    first_token = text.split(None, 1)[0].rstrip(":").upper()
+    return first_token in suppressed_levels
+
+
+def is_monitoring_event(event: dict) -> bool:
+    path = clean_path(event.get("path")).lower()
+    user_agent = clean_value(event.get("user_agent"), "").lower()
+
+    if path in MONITORING_PATHS or path.startswith("/health/"):
+        return True
+
+    return any(marker in user_agent for marker in MONITORING_USER_AGENT_MARKERS)
+
+
+def event_in_window(event: dict, start_dt: datetime | None, end_dt: datetime | None) -> bool:
+    timestamp = event.get("timestamp")
+    if timestamp is None:
+        return True
+    if start_dt and timestamp < start_dt:
+        return False
+    if end_dt and timestamp >= end_dt:
+        return False
+    return True
+
+
+def has_public_client_ip(event: dict) -> bool:
+    return ip_address_category(clean_value(event.get("client_ip"), "")) == "Public/global"
+
+
+def iter_progress_lines(path: Path, progress: FileProgress, start_offset: int = 0) -> Iterable[str | bytes]:
     if path.suffix.lower() == ".gz":
         with gzip.open(path, "rt", encoding="utf-8", errors="replace") as handle:
             if progress.enabled:
@@ -980,6 +1195,12 @@ def iter_progress_lines(path: Path, progress: FileProgress) -> Iterable[str | by
         return
 
     with path.open("rb") as handle:
+        if start_offset:
+            handle.seek(start_offset)
+            progress.bytes_seen = start_offset
+            if progress.bar is not None:
+                progress.bar.n = start_offset
+                progress.bar.refresh()
         if progress.enabled:
             for line in handle:
                 progress.observe_line(line)
@@ -1002,11 +1223,17 @@ def load_waf_stats(
     max_records: int,
     show_progress: bool = True,
     progress_interval: float = 5.0,
+    start_dt: datetime | None = None,
+    end_dt: datetime | None = None,
+    exclude_monitoring: bool = False,
+    require_public_client_ip: bool = False,
+    suppressed_log_levels: set[str] | None = None,
 ) -> tuple[UsageStats, dict[str, UsageStats], list[ParsedFile]]:
     stats = UsageStats("AWS WAF")
     monthly: dict[str, UsageStats] = {}
     parsed_files: list[ParsedFile] = []
     cloudwatch_dir = export_dir / "cloudwatch"
+    suppressed_log_levels = suppressed_log_levels or set()
 
     paths = sorted(cloudwatch_dir.glob("*.jsonl"))
     if show_progress:
@@ -1017,15 +1244,38 @@ def load_waf_stats(
             return stats, monthly, parsed_files
         parsed = ParsedFile(path=path, kind="AWS WAF CloudWatch JSONL")
         parsed_files.append(parsed)
+        start_offset = 0
+        if start_dt and path.suffix.lower() != ".gz":
+            start_offset = seek_jsonl_timestamp(path, datetime_to_ms(start_dt))
+            if show_progress:
+                progress_message(f"Seeking {path.name} to byte {fmt_int(start_offset)} for {format_datetime(start_dt)}")
         with FileProgress("WAF JSONL", path, show_progress, progress_interval) as progress:
-            for line in iter_progress_lines(path, progress):
+            for line in iter_progress_lines(path, progress, start_offset=start_offset):
                 line = line.strip()
                 if not line:
                     progress.maybe_report(parsed, stats.total)
                     continue
                 event = parse_cloudwatch_waf_line(line, tz, anonymize)
                 if event is None:
-                    parsed.errors += 1
+                    if is_suppressed_log_level_line(line, suppressed_log_levels):
+                        parsed.filtered += 1
+                    else:
+                        parsed.errors += 1
+                    progress.maybe_report(parsed, stats.total)
+                    continue
+                if end_dt and event.get("timestamp") and event["timestamp"] >= end_dt:
+                    progress.finish(parsed, stats.total)
+                    return stats, monthly, parsed_files
+                if not event_in_window(event, start_dt, end_dt):
+                    parsed.filtered += 1
+                    progress.maybe_report(parsed, stats.total)
+                    continue
+                if exclude_monitoring and is_monitoring_event(event):
+                    parsed.filtered += 1
+                    progress.maybe_report(parsed, stats.total)
+                    continue
+                if require_public_client_ip and not has_public_client_ip(event):
+                    parsed.filtered += 1
                     progress.maybe_report(parsed, stats.total)
                     continue
                 parsed.records += 1
@@ -1064,6 +1314,10 @@ def load_alb_stats(
     max_records: int,
     show_progress: bool = True,
     progress_interval: float = 5.0,
+    start_dt: datetime | None = None,
+    end_dt: datetime | None = None,
+    exclude_monitoring: bool = False,
+    require_public_client_ip: bool = False,
 ) -> tuple[UsageStats, dict[str, UsageStats], list[ParsedFile]]:
     stats = UsageStats("ALB access logs")
     monthly: dict[str, UsageStats] = {}
@@ -1085,6 +1339,18 @@ def load_alb_stats(
                 event = parse_alb_line(line, tz, anonymize)
                 if event is None:
                     parsed.errors += 1
+                    progress.maybe_report(parsed, stats.total)
+                    continue
+                if not event_in_window(event, start_dt, end_dt):
+                    parsed.filtered += 1
+                    progress.maybe_report(parsed, stats.total)
+                    continue
+                if exclude_monitoring and is_monitoring_event(event):
+                    parsed.filtered += 1
+                    progress.maybe_report(parsed, stats.total)
+                    continue
+                if require_public_client_ip and not has_public_client_ip(event):
+                    parsed.filtered += 1
                     progress.maybe_report(parsed, stats.total)
                     continue
                 parsed.records += 1
@@ -1322,6 +1588,96 @@ def counter_table(
     )
 
 
+def shared_ip_table(stats: UsageStats, limit: int = 12) -> str:
+    rows = []
+    for ip, user_agents in stats.ip_user_agents.items():
+        request_count = stats.client_ips.get(ip, 0)
+        rows.append((ip, len(user_agents), request_count))
+    rows.sort(key=lambda item: (item[1], item[2]), reverse=True)
+
+    if not rows:
+        return empty_panel("No IP and user-agent combinations were available.")
+
+    body = []
+    for rank, (ip, user_agent_count, request_count) in enumerate(rows[:limit], start=1):
+        body.append(
+            "<tr>"
+            f"<td>{rank}</td>"
+            f"<td>{html_escape(ip)}</td>"
+            f"<td class=\"num\">{fmt_int(user_agent_count)}</td>"
+            f"<td class=\"num\">{fmt_int(request_count)}</td>"
+            "</tr>"
+        )
+
+    return (
+        '<table><thead><tr>'
+        '<th class="rank">#</th><th>Client IP</th>'
+        '<th class="num">Distinct user agents</th><th class="num">Requests</th>'
+        '</tr></thead><tbody>'
+        + "\n".join(body)
+        + "</tbody></table>"
+    )
+
+
+def unique_users_section(stats: UsageStats, anonymized: bool) -> str:
+    unique_ip_user_agents = sum(len(user_agents) for user_agents in stats.ip_user_agents.values())
+    repeat_ips = sum(1 for count in stats.client_ips.values() if count > 1)
+    single_request_ips = sum(1 for count in stats.client_ips.values() if count == 1)
+    source_detail = "Anonymised network-level IPs" if anonymized else "Selected public IPs"
+
+    metrics = [
+        metric_card("Unique IPs", fmt_int(len(stats.unique_ips)), source_detail),
+        metric_card("IP + user-agent pairs", fmt_int(unique_ip_user_agents), "Proxy/NAT-aware estimate"),
+        metric_card("Unique user agents", fmt_int(len(stats.user_agents)), "Browser or automation signatures"),
+        metric_card("Unique JA4 fingerprints", fmt_int(len(stats.ja4_fingerprints)), "TLS/client fingerprint where present"),
+        metric_card("Unique JA3 fingerprints", fmt_int(len(stats.ja3_fingerprints)), "Legacy TLS fingerprint where present"),
+        metric_card("Repeat IPs", fmt_int(repeat_ips), f"{fmt_int(single_request_ips)} IPs only appeared once"),
+    ]
+
+    return f"""
+    <section>
+      <h2>Unique User Signals</h2>
+      <p class="note">These are best-effort log-based audience signals. They do not identify people: one person can use multiple IPs, and one IP can represent many users behind an office, mobile network, VPN, or bot fleet.</p>
+      <div class="metrics">
+        {"".join(metrics)}
+      </div>
+      <div class="grid two stack-panel">
+        <div class="panel">
+          <h3>Client IP Source Used</h3>
+          {counter_table(stats.client_ip_sources, stats.total, "Selected IP source", 8)}
+          <p class="note">Selection order is Cloudflare/forwarded public IP headers first, then WAF client IP only as a fallback.</p>
+        </div>
+        <div class="panel">
+          <h3>Selected IP Address Type</h3>
+          {counter_table(stats.client_ip_categories, stats.total, "IP address type", 8)}
+          <p class="note">Private/internal entries here would indicate load balancer or network addresses being counted as client IPs.</p>
+        </div>
+        <div class="panel">
+          <h3>Possible Shared IPs</h3>
+          {shared_ip_table(stats, 12)}
+        </div>
+        <div class="panel">
+          <h3>Top IP + User-Agent Pairs</h3>
+          {counter_table(stats.ip_user_agent_pairs, stats.total, "IP and user agent", 10)}
+        </div>
+        <div class="panel">
+          <h3>JA4 Fingerprints</h3>
+          {counter_table(stats.ja4_fingerprints, stats.total, "JA4 fingerprint", 10)}
+        </div>
+        <div class="panel">
+          <h3>JA3 Fingerprints</h3>
+          {counter_table(stats.ja3_fingerprints, stats.total, "JA3 fingerprint", 10)}
+        </div>
+        <div class="panel">
+          <h3>WAF Edge Client IPs</h3>
+          {counter_table(stats.edge_client_ips, stats.total, "WAF clientIp value", 10)}
+          <p class="note">This is the raw WAF client IP, often the CDN or proxy edge. It is shown here only to verify it was not used as the primary client IP when forwarded public IP headers were present.</p>
+        </div>
+      </div>
+    </section>
+    """
+
+
 def event_table(events: Iterable[dict], empty_message: str) -> str:
     rows = list(events)
     if not rows:
@@ -1367,12 +1723,14 @@ def files_table(files: list[ParsedFile], export_dir: Path) -> str:
             f"<td>{html_escape(display_path)}</td>"
             f"<td>{html_escape(item.kind)}</td>"
             f"<td class=\"num\">{fmt_int(item.records)}</td>"
+            f"<td class=\"num\">{fmt_int(item.filtered)}</td>"
             f"<td class=\"num\">{fmt_int(item.errors)}</td>"
             "</tr>"
         )
     return (
         '<table><thead><tr>'
-        '<th>File</th><th>Type</th><th class="num">Parsed records</th><th class="num">Skipped lines</th>'
+        '<th>File</th><th>Type</th><th class="num">Parsed records</th>'
+        '<th class="num">Filtered records</th><th class="num">Unreadable lines</th>'
         '</tr></thead><tbody>'
         + "\n".join(body)
         + "</tbody></table>"
@@ -1499,7 +1857,7 @@ def month_panel(index: int, key: str, stats: UsageStats) -> str:
 
     month_metrics = [
         metric_card("Requests", fmt_int(stats.total), f"{fmt_float(avg_per_day)} average per day"),
-        metric_card("Unique client IPs", fmt_int(len(stats.unique_ips)), "Best effort from request headers"),
+        metric_card("Unique client IPs", fmt_int(len(stats.unique_ips)), "Selected public request IPs"),
         metric_card("Blocked / challenged", pct(month_blocked, stats.total), f"{fmt_int(month_blocked)} records"),
         metric_card("Countries", fmt_int(len(stats.countries)), f"Top: {top_country}"),
         metric_card("Paths requested", fmt_int(len(stats.normalized_paths)), f"Top: {truncate(top_path, 38)}"),
@@ -1602,6 +1960,7 @@ def render_report(
     parsed_files: list[ParsedFile],
     context: dict,
     anonymized: bool,
+    filters: list[str],
 ) -> str:
     generated_at = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
     days = period_days(primary)
@@ -1624,7 +1983,7 @@ def render_report(
 
     metrics = [
         metric_card("Requests observed", fmt_int(primary.total), primary.name),
-        metric_card("Unique client IPs", fmt_int(len(primary.unique_ips)), "Best effort from request headers"),
+        metric_card("Unique client IPs", fmt_int(len(primary.unique_ips)), "Selected public request IPs"),
         metric_card("Countries", fmt_int(len(primary.countries)), "Based on WAF or proxy country data"),
         metric_card("Paths requested", fmt_int(len(primary.normalized_paths)), "Normalised by common IDs"),
         metric_card(outcome_label, outcome_value, outcome_detail),
@@ -1928,6 +2287,7 @@ def render_report(
         <div><strong>Load balancers:</strong> {html_escape(list_text(context.get("load_balancers", [])))}</div>
         <div><strong>WAF ACLs:</strong> {html_escape(list_text(context.get("waf_acls", [])))}</div>
         <div><strong>Client IPs:</strong> {"Anonymised to network level" if anonymized else "Shown as observed in logs"}</div>
+        <div><strong>Filters:</strong> {html_escape(list_text(filters, "None"))}</div>
       </div>
       <div class="metrics">
         {"".join(metrics)}
@@ -2012,6 +2372,8 @@ def render_report(
         </div>
       </div>
     </section>
+
+    {unique_users_section(primary, anonymized)}
 
     <section>
       <h2>Content And Referrals</h2>
@@ -2137,6 +2499,29 @@ def parse_args() -> argparse.Namespace:
         help="Optional maximum records per source to parse. 0 means no limit.",
     )
     parser.add_argument(
+        "--start-date",
+        help="Inclusive start date/time for records, for example 2026-01-01 or 2026-01-01T00:00:00Z.",
+    )
+    parser.add_argument(
+        "--end-date",
+        help="Exclusive end date/time for records, for example 2026-05-01 or 2026-05-01T00:00:00Z.",
+    )
+    parser.add_argument(
+        "--exclude-health-checks",
+        action="store_true",
+        help="Exclude health-check and Pingdom monitoring requests from the report.",
+    )
+    parser.add_argument(
+        "--require-public-client-ip",
+        action="store_true",
+        help="Exclude records whose selected client IP is not public/global.",
+    )
+    parser.add_argument(
+        "--exclude-log-levels",
+        default="INFO,ERROR",
+        help="Comma-separated raw CloudWatch message levels to skip when they are not WAF JSON. Default: INFO,ERROR.",
+    )
+    parser.add_argument(
         "--progress",
         action=argparse.BooleanOptionalAction,
         default=True,
@@ -2166,6 +2551,28 @@ def main() -> int:
     tz = load_timezone(args.timezone)
     out = Path(args.out).expanduser().resolve() if args.out else export_dir / "web_stats.html"
     show_progress = args.progress and args.progress_interval > 0
+    start_dt = parse_filter_datetime(args.start_date, tz)
+    end_dt = parse_filter_datetime(args.end_date, tz)
+    if start_dt and end_dt and end_dt <= start_dt:
+        print("[!] --end-date must be after --start-date.", file=sys.stderr)
+        return 1
+    suppressed_log_levels = {
+        level.strip().upper()
+        for level in args.exclude_log_levels.split(",")
+        if level.strip()
+    }
+
+    filters = []
+    if start_dt:
+        filters.append(f"from {format_datetime(start_dt)}")
+    if end_dt:
+        filters.append(f"before {format_datetime(end_dt)}")
+    if args.exclude_health_checks:
+        filters.append("health and monitoring checks removed")
+    if args.require_public_client_ip:
+        filters.append("non-public selected client IPs removed")
+    if suppressed_log_levels:
+        filters.append("raw non-traffic log-level messages removed")
 
     print(f"[*] Reading evidence from {export_dir}", flush=True)
     print(f"[*] JSON parser: {JSON_PARSER}", flush=True)
@@ -2176,6 +2583,11 @@ def main() -> int:
         args.max_records,
         show_progress=show_progress,
         progress_interval=args.progress_interval,
+        start_dt=start_dt,
+        end_dt=end_dt,
+        exclude_monitoring=args.exclude_health_checks,
+        require_public_client_ip=args.require_public_client_ip,
+        suppressed_log_levels=suppressed_log_levels,
     )
     print(f"[*] Parsed WAF records: {fmt_int(waf_stats.total)}", flush=True)
     alb_stats, alb_monthly, alb_files = load_alb_stats(
@@ -2185,6 +2597,10 @@ def main() -> int:
         args.max_records,
         show_progress=show_progress,
         progress_interval=args.progress_interval,
+        start_dt=start_dt,
+        end_dt=end_dt,
+        exclude_monitoring=args.exclude_health_checks,
+        require_public_client_ip=args.require_public_client_ip,
     )
     print(f"[*] Parsed ALB records: {fmt_int(alb_stats.total)}", flush=True)
 
@@ -2205,6 +2621,7 @@ def main() -> int:
         parsed_files=parsed_files,
         context=context,
         anonymized=args.anonymize_ips,
+        filters=filters,
     )
     write_report(out, html)
     print(f"[+] Wrote report: {out}", flush=True)

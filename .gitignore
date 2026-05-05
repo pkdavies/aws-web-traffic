@@ -1,2 +1,3 @@
 aws_web*
+data/*
 __pycache__/*
